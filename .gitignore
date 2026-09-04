@@ -1,0 +1,8 @@
+# Your own notes and screenshots stay on your Mac. The repo is the tool only.
+notes.jsonl
+notes.md
+refs/
+server.log
+.backup/
+__pycache__/
+.DS_Store

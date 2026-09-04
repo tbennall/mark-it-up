@@ -1,0 +1,17 @@
+{
+  "manifest_version": 3,
+  "name": "Mark it up",
+  "version": "1.1",
+  "description": "Point at anything on any page, say what is wrong with it, and the note lands in a file Claude reads.",
+  "action": { "default_title": "Mark it up (Alt+Shift+N)" },
+  "icons": { "48": "icon48.png", "128": "icon128.png" },
+  "background": { "service_worker": "background.js" },
+  "permissions": ["scripting", "activeTab"],
+  "host_permissions": ["http://localhost:8899/*"],
+  "commands": {
+    "_execute_action": {
+      "suggested_key": { "default": "Alt+Shift+N", "mac": "Alt+Shift+N" },
+      "description": "Mark it up on this tab"
+    }
+  }
+}
