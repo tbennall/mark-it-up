@@ -466,7 +466,7 @@ class Handler(BaseHTTPRequestHandler):
             "<script>"
             "function setDone(id,done){var inp=document.getElementById('act-'+id);"
             "fetch('/note/'+id+'/'+(done?'done':'reopen'),{method:'POST',headers:{'Content-Type':'application/json'},"
-            "body:JSON.stringify({by:'tom',action:inp?inp.value:''})}).then(()=>location.reload())}"
+            "body:JSON.stringify({by:'me',action:inp?inp.value:''})}).then(()=>location.reload())}"
             "</script>",
             "<div class=card style='border-style:dashed'>"
             "<b>On any site:</b> click the Mark it up button in Chrome's toolbar "

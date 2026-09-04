@@ -13,6 +13,15 @@
 
   var SERVER = 'http://localhost:8899';
   if (window.__reviewNotes) { window.__reviewNotes.toggle(); return; }
+  // Injected into every frame of the tab so things inside an embedded page
+  // (a Claude artefact, say) can be marked. Tiny frames (ad slots, hidden
+  // helpers) are skipped rather than sprouting a pill each.
+  var IN_FRAME = window !== window.top;
+  if (IN_FRAME && (window.innerWidth < 240 || window.innerHeight < 160)) return;
+
+  // Where the notes are going. The extension's background worker answers
+  // 'server' when server.py is running and 'local' when it keeps them itself.
+  var STORE = 'server';
 
   /* ---------- talking to the notes server ----------
      From the Chrome extension, every request goes through the background
@@ -25,6 +34,7 @@
       return new Promise(function (resolve, reject) {
         chrome.runtime.sendMessage({ type: 'notes', method: method, path: path, body: body }, function (res) {
           if (chrome.runtime.lastError || !res) return reject(new Error(chrome.runtime.lastError ? chrome.runtime.lastError.message : 'no reply'));
+          if (res.store) STORE = res.store;
           if (!res.ok) return reject(new Error(res.error || 'request failed'));
           resolve(res.data);
         });
@@ -608,7 +618,8 @@
       paintPill();
       if (panel) renderPanel();
       var extras = (res.note.links || []).length + (res.note.images || []).length;
-      say('Saved: note #' + res.note.n + (extras ? ' with ' + extras + ' attachment' + (extras > 1 ? 's' : '') : ''));
+      say('Saved: note #' + res.note.n + (extras ? ' with ' + extras + ' attachment' + (extras > 1 ? 's' : '') : '')
+        + (STORE === 'local' ? ' (kept in the extension)' : ''));
     }).catch(function () {
       try {
         var stash = JSON.parse(localStorage.getItem('__review_notes') || '[]');
@@ -658,7 +669,7 @@
       var acts = el('div', 'acts');
       var flip = el('button', null, done ? 'Reopen' : 'Done');
       flip.onclick = function () {
-        call('POST', '/note/' + n.id + (done ? '/reopen' : '/done'), { by: 'tom', action: '' })
+        call('POST', '/note/' + n.id + (done ? '/reopen' : '/done'), { by: 'me', action: '' })
           .then(function (res) {
             notes = notes.map(function (x) { return x.id === n.id ? res.note : x; });
             paintPill(); renderPanel();
@@ -680,15 +691,164 @@
     panel = el('div', 'panel');
     var h = el('h3', null, 'What I have marked');
     var sp = el('div', 'sp');
-    var open = el('button', null, 'Open the board');
-    open.className = 'btn';
-    open.onclick = function () { window.open(SERVER + '/', '_blank'); };
-    sp.appendChild(open);
+    if (STORE === 'local') {
+      // No notes server: the notes live in the extension, so the way out is
+      // a zip (notes.md plus the pictures) or the text on the clipboard.
+      var copy = el('button', 'btn sm', 'Copy notes');
+      copy.onclick = function () {
+        exportAll().then(function (bundle) {
+          return navigator.clipboard.writeText(bundle.markdown);
+        }).then(function () { say('Notes copied. Paste them into Claude.'); })
+          .catch(function () { say('Could not copy. Try Export instead.'); });
+      };
+      var exp = el('button', 'btn sm pri', 'Export zip');
+      exp.onclick = function () {
+        exportAll().then(function (bundle) {
+          download(bundle.blob, 'mark-it-up-notes.zip');
+          say('Downloading your notes as a zip');
+        }).catch(function (err) { say('Export failed: ' + err.message); });
+      };
+      sp.append(copy, exp);
+    } else {
+      var open = el('button', 'btn sm', 'Open the board');
+      open.onclick = function () { window.open(SERVER + '/', '_blank'); };
+      sp.appendChild(open);
+    }
     h.appendChild(sp);
     panel.appendChild(h);
     panel.appendChild(el('div', 'list'));
     wrap.appendChild(panel);
     renderPanel();
+  }
+
+  /* ---------- getting notes out without a server ----------
+     Builds the same notes.md the server writes, plus the pictures, and
+     packs them into one zip. The zip is written by hand (no compression,
+     just the container) so there is nothing to install. */
+  function exportAll() {
+    return Promise.all([call('GET', '/notes'), call('GET', '/filed').catch(function () { return { notes: [] }; })])
+      .then(function (res) {
+        var live = res[0].notes || [], filed = res[1].notes || [];
+        var files = [{ name: 'notes.md', bytes: new TextEncoder().encode(notesMarkdown(live, filed)) }];
+        live.concat(filed).forEach(function (n) {
+          (n.images || []).forEach(function (im) {
+            if (im.data && im.file) files.push({ name: im.file, bytes: bytesOf(im.data) });
+          });
+        });
+        return { markdown: notesMarkdown(live, filed), blob: zip(files) };
+      });
+  }
+
+  function notesMarkdown(live, filed) {
+    var open = live.filter(function (n) { return n.status !== 'done'; });
+    var done = live.filter(function (n) { return n.status === 'done'; });
+    var out = [
+      '# Mark-up notes', '',
+      'Written by pointing at pages in the browser, not by hand. Newest first inside each app.', '',
+      'Pictures are in `refs/` beside this file. A **Reference** is what it should look like; ' +
+      'a **Screenshot of what I marked** is how it looks today.', '',
+      '_' + open.length + ' open, ' + done.length + ' done, ' + filed.length + ' filed. Exported ' + new Date().toLocaleString() + '._', '',
+      '# OPEN', '',
+    ];
+    out = out.concat(open.length ? groupMd(open) : ['_Nothing open._', '']);
+    if (done.length) out = out.concat(['# DONE', ''], groupMd(done));
+    if (filed.length) out = out.concat(['# FILED (done earlier)', ''], groupMd(filed));
+    return out.join('\n');
+  }
+
+  function groupMd(list) {
+    var byApp = {};
+    list.forEach(function (n) { (byApp[n.app || '?'] = byApp[n.app || '?'] || []).push(n); });
+    var out = [];
+    Object.keys(byApp).sort().forEach(function (app) {
+      out.push('## ' + app, '');
+      byApp[app].sort(function (a, b) { return (b.n || 0) - (a.n || 0); }).forEach(function (n) {
+        out.push('### ' + (n.status === 'done' ? '✅ DONE · ' : '') + '#' + n.n + ' · ' + n.kind + ' · `' + n.route + '`' + (n.title ? ' · ' + n.title : ''), '', (n.text || '').trim(), '');
+        if (n.status === 'done') out.push('- **Done** by ' + (n.done_by || '?') + ' on ' + String(n.done_at || '').slice(0, 16).replace('T', ' ') + ': ' + (n.action || '(no detail given)'));
+        if (n.element) out.push('- **Element:** ' + n.element);
+        if (n.selector) out.push('- **Selector:** `' + n.selector + '`');
+        if (n.target_kind === 'area' && n.rect) out.push('- **Region:** ' + n.rect.w + '×' + n.rect.h + ' at (' + n.rect.x + ', ' + n.rect.y + '), viewport ' + n.viewport);
+        out.push('- **URL:** ' + n.url);
+        (n.links || []).forEach(function (l) { out.push('- **Reference link (make it like this):** ' + l); });
+        (n.images || []).forEach(function (im) {
+          out.push('- **' + (im.role === 'marked' ? 'Screenshot of what I marked' : 'Reference image (make it like this)') + ':** `' + im.file + '` (' + im.name + ')');
+        });
+        out.push('');
+      });
+    });
+    return out;
+  }
+
+  function bytesOf(dataUrl) {
+    var bin = atob(dataUrl.split(',')[1] || '');
+    var u8 = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+    return u8;
+  }
+
+  var CRC_TABLE = (function () {
+    var t = [], c;
+    for (var n = 0; n < 256; n++) {
+      c = n;
+      for (var k = 0; k < 8; k++) c = c & 1 ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+      t[n] = c >>> 0;
+    }
+    return t;
+  })();
+  function crc32(u8) {
+    var crc = -1;
+    for (var i = 0; i < u8.length; i++) crc = CRC_TABLE[(crc ^ u8[i]) & 0xff] ^ (crc >>> 8);
+    return (crc ^ -1) >>> 0;
+  }
+
+  // A "stored" (uncompressed) zip: local header + data per file, then the
+  // central directory, then the end record. Date fields are 1 Jan 1980.
+  function zip(files) {
+    var parts = [], central = [], offset = 0, enc = new TextEncoder();
+    files.forEach(function (f) {
+      var name = enc.encode(f.name), crc = crc32(f.bytes), size = f.bytes.length;
+      var lh = new DataView(new ArrayBuffer(30));
+      lh.setUint32(0, 0x04034b50, true); lh.setUint16(4, 20, true); lh.setUint16(6, 0x0800, true); lh.setUint16(8, 0, true);
+      lh.setUint16(10, 0, true); lh.setUint16(12, 0x21, true); lh.setUint32(14, crc, true);
+      lh.setUint32(18, size, true); lh.setUint32(22, size, true); lh.setUint16(26, name.length, true); lh.setUint16(28, 0, true);
+      parts.push(new Uint8Array(lh.buffer), name, f.bytes);
+      var cd = new DataView(new ArrayBuffer(46));
+      cd.setUint32(0, 0x02014b50, true); cd.setUint16(4, 20, true); cd.setUint16(6, 20, true); cd.setUint16(8, 0x0800, true);
+      cd.setUint16(10, 0, true); cd.setUint16(12, 0, true); cd.setUint16(14, 0x21, true); cd.setUint32(16, crc, true);
+      cd.setUint32(20, size, true); cd.setUint32(24, size, true); cd.setUint16(28, name.length, true);
+      cd.setUint16(30, 0, true); cd.setUint16(32, 0, true); cd.setUint16(34, 0, true); cd.setUint16(36, 0, true);
+      cd.setUint32(38, 0, true); cd.setUint32(42, offset, true);
+      central.push(new Uint8Array(cd.buffer), name);
+      offset += 30 + name.length + size;
+    });
+    var cdSize = central.reduce(function (a, b) { return a + b.length; }, 0);
+    var end = new DataView(new ArrayBuffer(22));
+    end.setUint32(0, 0x06054b50, true); end.setUint16(4, 0, true); end.setUint16(6, 0, true);
+    end.setUint16(8, files.length, true); end.setUint16(10, files.length, true);
+    end.setUint32(12, cdSize, true); end.setUint32(16, offset, true); end.setUint16(20, 0, true);
+    return new Blob(parts.concat(central, [new Uint8Array(end.buffer)]), { type: 'application/zip' });
+  }
+
+  function download(blob, name) {
+    if (VIA_EXTENSION) {
+      // Chrome blocks downloads started inside an embedded frame, so the
+      // extension's background worker saves the file instead.
+      var reader = new FileReader();
+      reader.onload = function () {
+        chrome.runtime.sendMessage({ type: 'download', name: name, dataUrl: reader.result }, function (res) {
+          if (chrome.runtime.lastError || !res || !res.ok) say('Could not save the zip' + (res && res.error ? ': ' + res.error : ''));
+        });
+      };
+      reader.readAsDataURL(blob);
+      return;
+    }
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = name;
+    a.style.display = 'none';
+    document.documentElement.appendChild(a);
+    a.click();
+    setTimeout(function () { a.remove(); URL.revokeObjectURL(a.href); }, 10000);
   }
 
   /* ---------- mode switching ---------- */
