@@ -53,6 +53,25 @@ Local Map My Turf dev servers (ports 5187, 5188, 5287) put the pill on the
 page by themselves when started with `TURF_REVIEW_NOTES=1`, so the button is
 only needed for everything else.
 
+## When something gets done
+
+Every note is open until someone marks it done. Then it drops to the bottom of
+`notes.md` with a line saying who did it, when, and what they did.
+
+- **Claude** marks a note done from the terminal after fixing it:
+
+  ```bash
+  python3 ~/Developer/review-notes/server.py done 7 "Moved the logo to the back, deployed to sandbox"
+  ```
+
+- **You** can do the same on the board (a "Mark done" button on every card,
+  with an optional "what was done" box) or from the in-page "My notes" list.
+  "Reopen" puts it back.
+- **File away** on the board (or `server.py file`) moves every done note out
+  of the working list into `filed.md`, a read-only history of what was asked
+  and what was done. Note numbers never repeat, so "#7" always means one thing.
+- `server.py list` prints what is open and done, one line each.
+
 ## What is in here
 
 - `server.py`: the collector. Standard library only, port 8899.
@@ -60,6 +79,7 @@ only needed for everything else.
 - `extension/manifest.json`, `background.js`: the Chrome extension.
 - `notes.jsonl`, `notes.md`: your notes, machine and human form.
 - `refs/`: the pictures attached to notes, named `<note id>-<n>.png`.
+- `filed.jsonl`, `filed.md`: done notes that have been filed away.
 
 ## If the pill does not appear
 

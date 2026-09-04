@@ -25,9 +25,84 @@ JSONL = os.path.join(HERE, "notes.jsonl")
 MARKDOWN = os.path.join(HERE, "notes.md")
 SCRIPT = os.path.join(HERE, "extension", "notes.js")
 REFS = os.path.join(HERE, "refs")  # reference images, one file per attachment
+FILED_JSONL = os.path.join(HERE, "filed.jsonl")  # done notes, moved out of the way
+FILED_MARKDOWN = os.path.join(HERE, "filed.md")
 PORT = int(os.environ.get("REVIEW_NOTES_PORT", "8899"))
 
 LOCK = threading.Lock()
+
+# Every note is "open" until someone marks it "done". Done notes carry who did
+# it, when, and a one-line "what was done". "Filing" moves done notes from
+# notes.jsonl into filed.jsonl so the working list only shows what is left.
+
+
+def is_done(note):
+    return note.get("status") == "done"
+
+
+def find_note(notes, key):
+    """A note by its id, or by its number ("7" or "#7")."""
+    key = str(key).strip().lstrip("#")
+    for note in notes:
+        if note.get("id") == key:
+            return note
+    if key.isdigit():
+        for note in notes:
+            if note.get("n") == int(key):
+                return note
+    return None
+
+
+def mark(note, done, action="", by="claude"):
+    if done:
+        note["status"] = "done"
+        note["done_at"] = datetime.now().isoformat(timespec="seconds")
+        note["done_by"] = by
+        if action:
+            note["action"] = str(action)[:2000]
+    else:
+        note["status"] = "open"
+        for key in ("done_at", "done_by"):
+            note.pop(key, None)
+    return note
+
+
+def read_filed():
+    if not os.path.exists(FILED_JSONL):
+        return []
+    out = []
+    with open(FILED_JSONL, "r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if line:
+                try:
+                    out.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+    return out
+
+
+def next_number(notes):
+    """Numbers keep climbing across filing, so #7 never means two things."""
+    highest = 0
+    for note in notes + read_filed():
+        highest = max(highest, note.get("n", 0))
+    return highest + 1
+
+
+def file_done_notes():
+    """Move every done note out of the working list. Returns how many moved."""
+    notes = read_notes()
+    done = [n for n in notes if is_done(n)]
+    if not done:
+        return 0
+    filed = read_filed() + done
+    with open(FILED_JSONL, "w", encoding="utf-8") as fh:
+        for note in filed:
+            fh.write(json.dumps(note) + "\n")
+    render_filed_markdown(filed)
+    write_notes([n for n in notes if not is_done(n)])
+    return len(done)
 
 # A note may carry pictures ("make it look like this") and links ("like this
 # site"). Pictures arrive from the overlay as data URLs and are written to
@@ -109,10 +184,59 @@ def write_notes(notes):
     render_markdown(notes)
 
 
-def render_markdown(notes):
+def note_markdown(note):
+    tick = "✅ DONE · " if is_done(note) else ""
+    lines = [
+        f"### {tick}#{note.get('n')} · {note.get('kind')} · `{note.get('route')}`"
+        + (f" · {note['title']}" if note.get('title') else ""),
+        "",
+        note.get("text", "").strip(),
+        "",
+    ]
+    if is_done(note):
+        when = (note.get("done_at") or "")[:16].replace("T", " ")
+        lines.append(f"- **Done** by {note.get('done_by', '?')} on {when}: "
+                     f"{note.get('action') or '(no detail given)'}")
+    elif note.get("action"):
+        lines.append(f"- **Progress:** {note['action']}")
+    if note.get("element"):
+        lines.append(f"- **Element:** {note['element']}")
+    if note.get("selector"):
+        lines.append(f"- **Selector:** `{note['selector']}`")
+    if note.get("target_kind") == "area":
+        rect = note.get("rect") or {}
+        lines.append(
+            f"- **Region:** {rect.get('w')}×{rect.get('h')} at "
+            f"({rect.get('x')}, {rect.get('y')}), viewport {note.get('viewport')}"
+        )
+    lines.append(f"- **URL:** {note.get('url')}")
+    for link in note.get("links") or []:
+        lines.append(f"- **Reference link (make it like this):** {link}")
+    for img in note.get("images") or []:
+        what = ("Screenshot of what I marked" if img.get("role") == "marked"
+                else "Reference image (make it like this)")
+        lines.append(f"- **{what}:** `{img.get('file')}` ({img.get('name')})")
+    lines.append(f"- **Mark done:** `python3 ~/Developer/review-notes/server.py done {note.get('n')} \"what you did\"`")
+    lines.append("")
+    return lines
+
+
+def grouped_by_app(notes):
     by_app = {}
     for note in notes:
         by_app.setdefault(note.get("app", "?"), []).append(note)
+    out = []
+    for app in sorted(by_app):
+        out.append(f"## {app}")
+        out.append("")
+        for note in sorted(by_app[app], key=lambda n: -n.get("n", 0)):
+            out.extend(note_markdown(note))
+    return out
+
+
+def render_markdown(notes):
+    open_notes = [n for n in notes if not is_done(n)]
+    done_notes = [n for n in notes if is_done(n)]
     lines = [
         "# Tom's mark-up notes",
         "",
@@ -123,37 +247,37 @@ def render_markdown(notes):
         "Read tool). A **Reference** is what Tom wants it to look like; a "
         "**Screenshot of what I marked** is how it looks today.",
         "",
-        f"_{len(notes)} note(s), last updated {datetime.now().strftime('%d %b %Y %H:%M')}._",
+        "When you have fixed a note, mark it done with the command under it "
+        "(say what you did in a sentence). Done notes drop to the bottom; "
+        "\"File away\" on the board moves them into `filed.md`.",
+        "",
+        f"_{len(open_notes)} open, {len(done_notes)} done and not yet filed, "
+        f"last updated {datetime.now().strftime('%d %b %Y %H:%M')}._",
+        "",
+        "# OPEN",
         "",
     ]
-    for app in sorted(by_app):
-        lines.append(f"## {app}")
+    lines.extend(grouped_by_app(open_notes) if open_notes else ["_Nothing open._", ""])
+    if done_notes:
+        lines.append("# DONE (not yet filed)")
         lines.append("")
-        for note in sorted(by_app[app], key=lambda n: -n.get("n", 0)):
-            lines.append(f"### #{note.get('n')} · {note.get('kind')} · `{note.get('route')}`"
-                         + (f" · {note['title']}" if note.get('title') else ""))
-            lines.append("")
-            lines.append(note.get("text", "").strip())
-            lines.append("")
-            if note.get("element"):
-                lines.append(f"- **Element:** {note['element']}")
-            if note.get("selector"):
-                lines.append(f"- **Selector:** `{note['selector']}`")
-            if note.get("target_kind") == "area":
-                rect = note.get("rect") or {}
-                lines.append(
-                    f"- **Region:** {rect.get('w')}×{rect.get('h')} at "
-                    f"({rect.get('x')}, {rect.get('y')}), viewport {note.get('viewport')}"
-                )
-            lines.append(f"- **URL:** {note.get('url')}")
-            for link in note.get("links") or []:
-                lines.append(f"- **Reference link (make it like this):** {link}")
-            for img in note.get("images") or []:
-                what = ("Screenshot of what I marked" if img.get("role") == "marked"
-                        else "Reference image (make it like this)")
-                lines.append(f"- **{what}:** `{img.get('file')}` ({img.get('name')})")
-            lines.append("")
+        lines.extend(grouped_by_app(done_notes))
     with open(MARKDOWN, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines))
+
+
+def render_filed_markdown(filed):
+    lines = [
+        "# Filed mark-up notes",
+        "",
+        "Notes that were marked done and then filed away from the working list. "
+        "Read-only history: what was asked, and what was done about it.",
+        "",
+        f"_{len(filed)} filed note(s), last updated {datetime.now().strftime('%d %b %Y %H:%M')}._",
+        "",
+    ]
+    lines.extend(grouped_by_app(filed))
+    with open(FILED_MARKDOWN, "w", encoding="utf-8") as fh:
         fh.write("\n".join(lines))
 
 
@@ -187,6 +311,14 @@ h2{font-size:14px;text-transform:uppercase;letter-spacing:.05em;color:#6b747b;ma
 .refs a.thumb{display:block;border:1px solid #dce0da;border-radius:8px;overflow:hidden;background:#f2f4f0}
 .refs a.thumb img{display:block;max-height:160px;max-width:260px}
 .refs .cap{font-size:10px;color:#6b747b;padding:2px 6px;text-transform:uppercase;letter-spacing:.04em}
+.card.done{opacity:.62;border-style:dashed}
+.card.done .meta .k{color:#2f7d4f}
+.done-line{margin-top:8px;font-size:13px;padding:8px 10px;border-radius:8px;background:#e8f3ec;color:#1f5a38}
+@media (prefers-color-scheme:dark){.done-line{background:#14261b!important;color:#9fd4b3!important}}
+.acts{margin-top:10px;display:flex;gap:6px;align-items:center}
+.acts button{font-size:12px;padding:5px 10px}
+.acts input{font:inherit;font-size:12px;flex:1;border:1px solid #c2c8bd;border-radius:8px;padding:5px 8px;min-width:0}
+.counts{font-size:12px;color:#6b747b;align-self:center;margin-left:auto}
 """
 
 
@@ -233,23 +365,49 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, json.dumps({"error": "not found"}))
 
     def do_POST(self):
-        if self.path != "/note":
-            self._send(404, json.dumps({"error": "not found"}))
-            return
         length = int(self.headers.get("Content-Length", "0"))
         try:
-            note = json.loads(self.rfile.read(length) or b"{}")
+            body = json.loads(self.rfile.read(length) or b"{}")
         except json.JSONDecodeError:
             self._send(400, json.dumps({"error": "bad json"}))
             return
-        if not isinstance(note, dict):
+        if not isinstance(body, dict):
             self._send(400, json.dumps({"error": "bad json"}))
             return
+
+        # Mark one note done or open again: POST /note/<id or number>/done
+        status = re.match(r"^/note/([A-Za-z0-9#]+)/(done|reopen)$", self.path)
+        if status:
+            with LOCK:
+                notes = read_notes()
+                note = find_note(notes, status.group(1))
+                if not note:
+                    self._send(404, json.dumps({"error": "no such note"}))
+                    return
+                mark(note, status.group(2) == "done", body.get("action", ""), body.get("by") or "tom")
+                write_notes(notes)
+            print(f"  note #{note['n']} {'done' if is_done(note) else 'reopened'}: {note.get('action', '')[:70]}")
+            self._send(200, json.dumps({"ok": True, "note": note}))
+            return
+
+        # Move every done note into filed.jsonl / filed.md.
+        if self.path == "/file-done":
+            with LOCK:
+                moved = file_done_notes()
+            print(f"  filed {moved} done note(s)")
+            self._send(200, json.dumps({"ok": True, "filed": moved}))
+            return
+
+        if self.path != "/note":
+            self._send(404, json.dumps({"error": "not found"}))
+            return
+        note = body
         images = note.pop("images", None)
         with LOCK:
             notes = read_notes()
             note["id"] = uuid.uuid4().hex[:10]
-            note["n"] = (max([n.get("n", 0) for n in notes]) + 1) if notes else 1
+            note["n"] = next_number(notes)
+            note["status"] = "open"
             note["links"] = clean_links(note.get("links"))
             note["images"] = save_images(note["id"], images)
             notes.append(note)
@@ -285,22 +443,31 @@ class Handler(BaseHTTPRequestHandler):
 
     def board(self):
         notes = read_notes()
-        by_app = {}
-        for note in notes:
-            by_app.setdefault(note.get("app", "?"), []).append(note)
+        open_count = len([n for n in notes if not is_done(n)])
+        done_count = len(notes) - open_count
+        filed_count = len(read_filed())
         parts = [
             "<!doctype html><meta charset=utf-8>",
             "<meta name=viewport content='width=device-width,initial-scale=1'>",
             "<title>Walkthrough notes</title>",
             f"<style>{BOARD_CSS}</style>",
             "<header><h1>Walkthrough notes</h1>",
-            f"<div class=sub>{len(notes)} note(s). Everything you marked while "
+            f"<div class=sub>{open_count} open, {done_count} done. Everything you marked while "
             "clicking around, newest first. This page refreshes itself.</div></header><main>",
             "<div class=tools><button onclick='location.reload()'>Refresh</button>"
             "<button onclick=\"navigator.clipboard.writeText(document.body.innerText)\">"
             "Copy all</button>"
-            "<button onclick=\"if(confirm('Delete every note?'))fetch('/notes',{method:'DELETE'})"
-            ".then(()=>location.reload())\">Clear all</button></div>",
+            f"<button {'disabled' if not done_count else ''} onclick=\"fetch('/file-done',{{method:'POST',"
+            "headers:{'Content-Type':'application/json'},body:'{}'})"
+            f".then(()=>location.reload())\">File away {done_count} done</button>"
+            "<button onclick=\"if(confirm('Delete every note, open and done?'))fetch('/notes',{method:'DELETE'})"
+            ".then(()=>location.reload())\">Clear all</button>"
+            f"<span class=counts>{filed_count} filed in <code>filed.md</code></span></div>",
+            "<script>"
+            "function setDone(id,done){var inp=document.getElementById('act-'+id);"
+            "fetch('/note/'+id+'/'+(done?'done':'reopen'),{method:'POST',headers:{'Content-Type':'application/json'},"
+            "body:JSON.stringify({by:'tom',action:inp?inp.value:''})}).then(()=>location.reload())}"
+            "</script>",
             "<div class=card style='border-style:dashed'>"
             "<b>On any site:</b> click the Mark it up button in Chrome's toolbar "
             "(the extension in <code>~/Developer/review-notes/extension</code>), "
@@ -313,35 +480,63 @@ class Handler(BaseHTTPRequestHandler):
         ]
         if not notes:
             parts.append("<div class=empty>Nothing marked yet.</div>")
-        for app in sorted(by_app):
-            parts.append(f"<h2>{esc(app)}</h2>")
-            for note in sorted(by_app[app], key=lambda n: -n.get("n", 0)):
-                parts.append("<div class=card><div class=meta>")
-                parts.append(f"<span class=k>#{note.get('n')} · {esc(note.get('kind', ''))}</span>")
-                parts.append(f"<span>{esc(note.get('route', ''))}</span>")
-                parts.append(f"<span>{esc((note.get('at') or '')[:16].replace('T', ' '))}</span>")
-                parts.append("</div>")
-                parts.append(f"<div class=txt>{esc(note.get('text', ''))}</div>")
-                det = []
-                if note.get("element"):
-                    det.append(f"{esc(note['element'])}")
-                if note.get("selector"):
-                    det.append(f"<code>{esc(note['selector'])}</code>")
-                if det:
-                    parts.append(f"<div class=det>{'<br>'.join(det)}</div>")
-                refs = []
-                for link in note.get("links") or []:
-                    refs.append(f"<a class=link href=\"{esc(link)}\" target=_blank rel=noopener>"
-                                f"\U0001f517 {esc(link)}</a>")
-                for img in note.get("images") or []:
-                    cap = "what I marked" if img.get("role") == "marked" else "make it like this"
-                    refs.append(f"<a class=thumb href=\"/{esc(img.get('file'))}\" target=_blank>"
-                                f"<img src=\"/{esc(img.get('file'))}\" alt=\"{esc(img.get('name'))}\">"
-                                f"<div class=cap>{cap}</div></a>")
-                if refs:
-                    parts.append(f"<div class=refs>{''.join(refs)}</div>")
-                parts.append("</div>")
-        parts.append("</main><script>setTimeout(()=>location.reload(),15000)</script>")
+        for heading, group in (("Open", [n for n in notes if not is_done(n)]),
+                               ("Done, not yet filed", [n for n in notes if is_done(n)])):
+            if not group:
+                continue
+            parts.append(f"<h2 style='font-size:16px;color:inherit'>{heading}</h2>")
+            by_app = {}
+            for note in group:
+                by_app.setdefault(note.get("app", "?"), []).append(note)
+            for app in sorted(by_app):
+                parts.append(f"<h2>{esc(app)}</h2>")
+                for note in sorted(by_app[app], key=lambda n: -n.get("n", 0)):
+                    parts.append(self.card(note))
+        parts.append("</main><script>"
+                     # Refresh only while nobody is typing a "what I did" line.
+                     "setInterval(()=>{if(!document.activeElement||document.activeElement.tagName!=='INPUT')location.reload()},15000)"
+                     "</script>")
+        return "".join(parts)
+
+    def card(self, note):
+        done = is_done(note)
+        parts = [f"<div class='card{' done' if done else ''}'><div class=meta>"]
+        parts.append(f"<span class=k>{'✅ ' if done else ''}#{note.get('n')} · {esc(note.get('kind', ''))}</span>")
+        parts.append(f"<span>{esc(note.get('route', ''))}</span>")
+        parts.append(f"<span>{esc((note.get('at') or '')[:16].replace('T', ' '))}</span>")
+        parts.append("</div>")
+        parts.append(f"<div class=txt>{esc(note.get('text', ''))}</div>")
+        if done:
+            when = (note.get("done_at") or "")[:16].replace("T", " ")
+            parts.append(f"<div class=done-line><b>Done</b> by {esc(note.get('done_by', '?'))} on {esc(when)}: "
+                         f"{esc(note.get('action') or 'no detail given')}</div>")
+        elif note.get("action"):
+            parts.append(f"<div class=done-line><b>Progress:</b> {esc(note['action'])}</div>")
+        det = []
+        if note.get("element"):
+            det.append(f"{esc(note['element'])}")
+        if note.get("selector"):
+            det.append(f"<code>{esc(note['selector'])}</code>")
+        if det:
+            parts.append(f"<div class=det>{'<br>'.join(det)}</div>")
+        refs = []
+        for link in note.get("links") or []:
+            refs.append(f"<a class=link href=\"{esc(link)}\" target=_blank rel=noopener>"
+                        f"\U0001f517 {esc(link)}</a>")
+        for img in note.get("images") or []:
+            cap = "what I marked" if img.get("role") == "marked" else "make it like this"
+            refs.append(f"<a class=thumb href=\"/{esc(img.get('file'))}\" target=_blank>"
+                        f"<img src=\"/{esc(img.get('file'))}\" alt=\"{esc(img.get('name'))}\">"
+                        f"<div class=cap>{cap}</div></a>")
+        if refs:
+            parts.append(f"<div class=refs>{''.join(refs)}</div>")
+        nid = esc(note.get("id", ""))
+        if done:
+            parts.append(f"<div class=acts><button onclick=\"setDone('{nid}',false)\">Reopen</button></div>")
+        else:
+            parts.append(f"<div class=acts><input id='act-{nid}' placeholder='What was done (optional)'>"
+                         f"<button onclick=\"setDone('{nid}',true)\">Mark done</button></div>")
+        parts.append("</div>")
         return "".join(parts)
 
 
@@ -350,8 +545,74 @@ def esc(text):
             .replace(">", "&gt;").replace('"', "&quot;"))
 
 
+def cli(argv):
+    """Mark notes done from a terminal (this is how Claude does it).
+
+        server.py done 7 "Moved the logo to the back, deployed to sandbox"
+        server.py reopen 7
+        server.py file          # move every done note into filed.md
+        server.py list          # what is open
+
+    Goes through the running server when there is one, so nothing races the
+    overlay; falls back to the files when the server is down.
+    """
+    import urllib.request
+    import urllib.error
+
+    def via_server(path, body):
+        req = urllib.request.Request(f"http://127.0.0.1:{PORT}{path}", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"}, method="POST")
+        try:
+            return json.load(urllib.request.urlopen(req, timeout=3))
+        except urllib.error.HTTPError as err:
+            return {"ok": False, "error": err.read().decode(errors="replace")}
+        except (urllib.error.URLError, OSError):
+            return None  # server not running
+
+    cmd = argv[0]
+    if cmd == "list":
+        for note in read_notes():
+            flag = "done" if is_done(note) else "open"
+            print(f"#{note.get('n'):<4} {flag:<5} {note.get('app', ''):<28} {note.get('kind', ''):<9} {note.get('text', '')[:80]}")
+        return 0
+    if cmd in ("done", "reopen"):
+        if len(argv) < 2:
+            print(f"usage: server.py {cmd} <note number or id> [what was done]")
+            return 2
+        action = " ".join(argv[2:])
+        res = via_server(f"/note/{argv[1].lstrip('#')}/{cmd}", {"action": action, "by": "claude"})
+        if res is None:
+            notes = read_notes()
+            note = find_note(notes, argv[1])
+            if not note:
+                print("no such note")
+                return 1
+            mark(note, cmd == "done", action, "claude")
+            write_notes(notes)
+            res = {"ok": True, "note": note}
+        if not res.get("ok"):
+            print(res.get("error", "failed"))
+            return 1
+        note = res["note"]
+        print(f"#{note['n']} {'done' if is_done(note) else 'reopened'}: {note.get('text', '')[:60]}")
+        return 0
+    if cmd == "file":
+        res = via_server("/file-done", {})
+        moved = res["filed"] if res else file_done_notes()
+        print(f"filed {moved} done note(s) into {FILED_MARKDOWN}")
+        return 0
+    print(__doc__)
+    print(cli.__doc__)
+    return 2
+
+
 if __name__ == "__main__":
+    import sys
+    if len(sys.argv) > 1:
+        sys.exit(cli(sys.argv[1:]))
     if os.path.exists(JSONL):
         render_markdown(read_notes())
+    if os.path.exists(FILED_JSONL):
+        render_filed_markdown(read_filed())
     print(f"Review notes on http://localhost:{PORT}  ·  notes → {JSONL}")
     ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()

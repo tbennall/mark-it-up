@@ -121,6 +121,9 @@
     '.n .txt{font-size:12px;white-space:pre-wrap}',
     '.n .acts{margin-top:5px;display:flex;gap:6px}',
     '.n .acts button{font:inherit;font-size:11px;border:1px solid #dce0da;background:#fff;border-radius:6px;padding:3px 8px;cursor:pointer}',
+    '.n.done{opacity:.55;border-style:dashed}',
+    '.n.done .meta b{color:#2f7d4f}',
+    '.n .did{font-size:11px;color:#1f5a38;background:#e8f3ec;border-radius:6px;padding:4px 7px;margin-top:4px}',
     '.empty{padding:22px 14px;text-align:center;color:#6b747b;font-size:12px}',
     '.toast{position:fixed;left:50%;transform:translateX(-50%);bottom:80px;pointer-events:none;background:#14181a;color:#fff;',
     '  font-size:12px;font-weight:600;padding:8px 14px;border-radius:8px;opacity:0;transition:opacity .18s}',
@@ -625,7 +628,8 @@
 
   function paintPill() {
     var base = mode === 'off' ? 'Mark it up' : 'Marking on';
-    pillTxt.textContent = notes.length ? base + ' · ' + notes.length : base;
+    var open = notes.filter(function (n) { return n.status !== 'done'; }).length;
+    pillTxt.textContent = open ? base + ' · ' + open + ' open' : base;
   }
 
   /* ---------- the list ---------- */
@@ -636,23 +640,36 @@
       list.appendChild(el('div', 'empty', 'No notes yet. Point at something and say what is wrong with it.'));
       return;
     }
-    notes.forEach(function (n) {
-      var box = el('div', 'n');
+    // Open notes first, done ones greyed out underneath.
+    var ordered = notes.filter(function (n) { return n.status !== 'done'; })
+      .concat(notes.filter(function (n) { return n.status === 'done'; }));
+    ordered.forEach(function (n) {
+      var done = n.status === 'done';
+      var box = el('div', 'n' + (done ? ' done' : ''));
       var meta = el('div', 'meta');
-      meta.appendChild(el('b', null, '#' + n.n + ' ' + n.kind));
+      meta.appendChild(el('b', null, (done ? '✅ ' : '') + '#' + n.n + ' ' + n.kind));
       meta.appendChild(el('span', null, n.app));
       meta.appendChild(el('span', null, n.route));
       var nl = (n.links || []).length, ni = (n.images || []).length;
       if (nl || ni) meta.appendChild(el('span', null, (nl ? '🔗' + nl + ' ' : '') + (ni ? '🖼' + ni : '')));
       box.appendChild(meta);
       box.appendChild(el('div', 'txt', n.text));
+      if (done) box.appendChild(el('div', 'did', 'Done by ' + (n.done_by || '?') + ': ' + (n.action || 'no detail given')));
       var acts = el('div', 'acts');
+      var flip = el('button', null, done ? 'Reopen' : 'Done');
+      flip.onclick = function () {
+        call('POST', '/note/' + n.id + (done ? '/reopen' : '/done'), { by: 'tom', action: '' })
+          .then(function (res) {
+            notes = notes.map(function (x) { return x.id === n.id ? res.note : x; });
+            paintPill(); renderPanel();
+          }).catch(function () { say('Notes server is not running'); });
+      };
       var del = el('button', null, 'Delete');
       del.onclick = function () {
         call('DELETE', '/note/' + n.id)
           .then(function () { notes = notes.filter(function (x) { return x.id !== n.id; }); paintPill(); renderPanel(); });
       };
-      acts.appendChild(del);
+      acts.append(flip, del);
       box.appendChild(acts);
       list.appendChild(box);
     });

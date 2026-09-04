@@ -6,3 +6,5 @@ server.log
 .backup/
 __pycache__/
 .DS_Store
+filed.jsonl
+filed.md
