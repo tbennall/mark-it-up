@@ -47,8 +47,41 @@ click Keep.
 - `[` widens the selection to the box around the thing, `]` narrows it back.
   **Drag a box** on the toolbar marks a whole region instead of one thing.
 - Press **N** (or the pill) to stop marking and use the page normally.
-- **My notes** on the toolbar lists everything you have marked, with a
-  **Done** button on each (and **Reopen** if you change your mind).
+- **My notes** on the toolbar lists everything you have marked, with
+  **Edit**, **Done** (or **Reopen**) and **Delete** on each. Edit reopens the
+  note so you can reword it, change its type or change its component. What
+  the tool measured when you marked the thing (which element it was, where it
+  sat, the screenshots) is never changed by an edit, so a reworded note can
+  never come loose from what it points at. Delete asks first, because there
+  is no undo.
+- The card can be **dragged by its top strip** if it lands on top of the very
+  thing you are trying to look at.
+
+## Saying which component to build it out of
+
+Under the words, the card asks **Build this out of**. This is for teams with
+a component library: instead of "make this look better", a note can say
+"build this spot out of `WheelPicker`", which is an instruction rather than a
+hint.
+
+- **Type a name.** The component list is fetched from the library once and
+  searched right there in the card. Arrow keys and Enter, no mouse.
+- **Open the library.** Opens the catalogue in a new tab with a **Use** button
+  on every component. Click one and the tab closes itself, with the name back
+  on your note.
+- **Nothing fits, build a new one.** Says so on the note, so whoever picks it
+  up adds the component to the library first and then uses it here.
+
+Nothing here is compulsory. Leave it blank and the note behaves as it always
+did, and if the library cannot be reached you can still type a name by hand.
+
+By default the library is `https://proact-ui.fly.dev`. To point it somewhere
+else (a dev server, say), run this in the browser console on the page you are
+marking up:
+
+```js
+localStorage.setItem('__review_notes_library', 'http://localhost:5190')
+```
 
 It works on ordinary websites and inside embedded pages, so you can mark
 things inside a Claude artefact too.
@@ -97,7 +130,9 @@ python3 ~/path/to/mark-it-up/server.py
 - `extension/`: the Chrome extension. `notes.js` is the overlay,
   `background.js` keeps the notes.
 - `server.py`: the optional notes server for Claude Code users. Standard
-  library only, port 8899.
+  library only, port 8899. To point the overlay at a different one while
+  testing, set `localStorage.__review_notes_server`; the extension itself
+  always uses the real one.
 
 Your own notes never go into this repository: `notes.*`, `filed.*`, `refs/`
 are ignored by git.
@@ -109,4 +144,10 @@ are ignored by git.
 - **"Snap what I marked" complains:** click the toolbar button once on that
   tab, then try again. Chrome only allows the snapshot after you have clicked.
 - **After editing `notes.js`** (developers only): press the reload arrow on
-  the extension's card in `chrome://extensions`.
+  the extension's card in `chrome://extensions`. If the version or the
+  permissions changed, Chrome may also ask you to confirm the new
+  permissions on that page.
+- **"Open the library" does nothing:** the catalogue has to be reachable and
+  serving `/api/components`. Check the address in
+  `localStorage.__review_notes_library`. Typing the component name by hand
+  always works regardless.

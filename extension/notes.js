@@ -11,7 +11,13 @@
 (function () {
   'use strict';
 
+  // The notes server. Overridable, because a review tool that can only ever
+  // write to one file on one port cannot be tested without writing to Tom's
+  // real notes (which is exactly what happened on 15 Sep 2026). Only the
+  // injected path reads this; through the extension every request goes to the
+  // background worker, which always uses the real server.
   var SERVER = 'http://localhost:8899';
+  try { SERVER = window.__reviewNotesServer || localStorage.getItem('__review_notes_server') || SERVER; } catch (err) { /* ignore */ }
   if (window.__reviewNotes) { window.__reviewNotes.toggle(); return; }
   // Injected into every frame of the tab so things inside an embedded page
   // (a Claude artefact, say) can be marked. Tiny frames (ad slots, hidden
@@ -45,6 +51,98 @@
       headers: body ? { 'Content-Type': 'application/json' } : undefined,
       body: body ? JSON.stringify(body) : undefined,
     }).then(function (r) { return r.json(); });
+  }
+
+  /* ---------- the component library ----------
+     The catalogue (packages/ui/gallery, the Fly app `proact-ui`) is the list
+     of every piece @proact/ui has. A note can name one, and that name is an
+     instruction to the next chat: build this spot out of THIS component,
+     do not hand-roll a lookalike.
+
+     Two ways to name one:
+       1. SEARCH, inside the note card. The list is fetched once and cached,
+          so picking a component you already know is two keystrokes and
+          never leaves the page.
+       2. BROWSE. "Open the library" opens the catalogue in pick mode, you
+          click the component you want, the tab shuts itself and the name
+          lands back on the note.
+
+     Both go through the background worker, so a live site's Content Security
+     Policy never sees the request. If the library cannot be reached, typing
+     the name by hand still works: the picker is a convenience, never a gate. */
+  var LIBRARY = 'https://proact-ui.fly.dev';
+  try { LIBRARY = localStorage.getItem('__review_notes_library') || LIBRARY; } catch (err) { /* ignore */ }
+  var CATALOGUE_KEY = '__review_notes_catalogue';
+  var catalogue = null;        // [{ name, block, group, house, url }]
+  var catalogueError = '';
+
+  /* This browser's copy first, so the box is never empty, then a refresh
+     from the library behind it. */
+  function loadCatalogue() {
+    try {
+      var cached = JSON.parse(localStorage.getItem(CATALOGUE_KEY) || 'null');
+      if (cached && Array.isArray(cached.items) && cached.items.length) catalogue = cached.items;
+    } catch (err) { /* ignore */ }
+    var ask = VIA_EXTENSION
+      ? new Promise(function (resolve, reject) {
+          chrome.runtime.sendMessage({ type: 'library', url: LIBRARY + '/api/components' }, function (res) {
+            if (chrome.runtime.lastError || !res || !res.ok) return reject(new Error((res && res.error) || 'no reply'));
+            resolve(res.data);
+          });
+        })
+      : fetch(LIBRARY + '/api/components').then(function (r) { return r.json(); });
+    return ask.then(function (data) {
+      var items = (data && data.components) || [];
+      if (!items.length) throw new Error('the library sent an empty list');
+      catalogue = items;
+      catalogueError = '';
+      try { localStorage.setItem(CATALOGUE_KEY, JSON.stringify({ at: Date.now(), items: items })); } catch (err) { /* ignore */ }
+      return items;
+    }).catch(function (err) {
+      catalogueError = catalogue ? '' : (err.message || 'could not reach the library');
+      return catalogue || [];
+    });
+  }
+
+  /* Names that start with what you typed first, then names that contain it,
+     then anything filed under a matching section. */
+  function searchCatalogue(q) {
+    var items = catalogue || [];
+    q = String(q || '').trim().toLowerCase();
+    if (!q) return items.slice(0, 40);
+    var starts = [], has = [], near = [];
+    items.forEach(function (c) {
+      var n = String(c.name || '').toLowerCase();
+      if (n.indexOf(q) === 0) starts.push(c);
+      else if (n.indexOf(q) >= 0) has.push(c);
+      else if ((String(c.block || '') + ' ' + String(c.group || '')).toLowerCase().indexOf(q) >= 0) near.push(c);
+    });
+    return starts.concat(has, near).slice(0, 40);
+  }
+
+  /* The library tab answers through the background worker. Only the frame
+     that asked has a token waiting, so the other frames ignore it. */
+  var awaitingPick = null;   // { token, take }
+  if (VIA_EXTENSION && chrome.runtime.onMessage) {
+    chrome.runtime.onMessage.addListener(function (msg) {
+      if (!msg || msg.type !== 'picked' || !awaitingPick) return;
+      if (msg.token !== awaitingPick.token) return;
+      var take = awaitingPick.take;
+      awaitingPick = null;
+      take(msg.component || null);
+    });
+  }
+
+  function browseLibrary(take) {
+    if (!VIA_EXTENSION) { say('The library picker needs the Chrome extension'); return; }
+    var token = 'p' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+    awaitingPick = { token: token, take: take };
+    chrome.runtime.sendMessage({ type: 'pick', token: token, url: LIBRARY + '/?pick=' + token }, function (res) {
+      if (chrome.runtime.lastError || !res || !res.ok) {
+        awaitingPick = null;
+        say('Could not open the component library at ' + LIBRARY);
+      }
+    });
   }
 
   /* ---------- which app are we looking at ----------
@@ -88,9 +186,38 @@
     '.hl{position:fixed;pointer-events:none;background:#d4553a;color:#fff;font-size:11px;font-weight:600;padding:3px 7px;',
     '  border-radius:5px;white-space:nowrap;max-width:60vw;overflow:hidden;text-overflow:ellipsis}',
     '.sel-box{position:fixed;pointer-events:none;border:2px dashed #d4553a;background:rgba(212,85,58,.10);border-radius:4px}',
-    '.card{position:fixed;pointer-events:auto;width:360px;background:#fff;border:1px solid #dce0da;border-radius:12px;',
+    /* The card never guesses its own size (it grows with attachments and the
+       component row): placeCard measures it. It also never grows past the
+       screen — past that it scrolls inside itself and the buttons stay put. */
+    '.card{position:fixed;pointer-events:auto;width:360px;max-height:calc(100vh - 20px);overflow:auto;overscroll-behavior:contain;',
+    '  background:#fff;border:1px solid #dce0da;border-radius:12px;',
     '  box-shadow:0 20px 48px -18px rgba(0,0,0,.45);padding:12px;display:flex;flex-direction:column;gap:9px}',
     '.card.drop{outline:2px dashed #d4553a;outline-offset:-4px}',
+    '.card .row{position:sticky;bottom:-12px;z-index:2;background:#fff;border-top:1px solid #e6e9e2;margin:0 -12px -12px;padding:9px 12px 12px}',
+    /* Grab the top strip to move the card off whatever it is covering. */
+    '.grab{display:flex;align-items:center;gap:6px;margin:-12px -12px 0;padding:8px 12px 6px;cursor:grab;user-select:none;border-bottom:1px solid #f0f2ee}',
+    '.grab.on{cursor:grabbing}',
+    '.grab .dots{color:#c2c8bd;font-size:13px;letter-spacing:1px}',
+    '.grab .ttl{font-size:11px;color:#6b747b;font-weight:600;text-transform:uppercase;letter-spacing:.05em}',
+    '.grab .shut{margin-left:auto;border:0;background:transparent;color:#6b747b;font-size:15px;line-height:1;cursor:pointer;padding:0 2px}',
+    /* The component picker. */
+    '.comp{border-top:1px solid #e6e9e2;padding-top:8px;display:flex;flex-direction:column;gap:6px}',
+    '.comprow{display:flex;gap:5px}',
+    '.comprow input{font:inherit;font-size:12px;flex:1;border:1px solid #c2c8bd;border-radius:7px;padding:6px 8px;color:#14181a;background:#fff;min-width:0}',
+    '.comprow input:focus{outline:2px solid #d4553a;outline-offset:-1px;border-color:#d4553a}',
+    '.hits{border:1px solid #e6e9e2;border-radius:7px;max-height:148px;overflow:auto;background:#fdfdfc}',
+    '.hits button{display:block;width:100%;text-align:left;font:inherit;font-size:12px;border:0;border-bottom:1px solid #f0f2ee;',
+    '  background:transparent;padding:6px 8px;cursor:pointer;color:#14181a}',
+    '.hits button:last-child{border-bottom:0}',
+    '.hits button:hover,.hits button.cur{background:#fdece7}',
+    '.hits .g{font-size:10px;color:#6b747b;font-weight:600;margin-left:6px}',
+    '.hits .house{font-size:9px;color:#a8382a;font-weight:700;margin-left:6px;letter-spacing:.04em}',
+    '.hits .none{padding:8px;font-size:11px;color:#6b747b}',
+    '.chosen{display:flex;align-items:center;gap:6px;background:#eef3ec;border:1px solid #cfdcc8;border-radius:8px;padding:5px 7px;font-size:12px}',
+    '.chosen b{color:#1f5a38}',
+    '.chosen .x{margin-left:auto;border:0;background:#14181a;color:#fff;border-radius:50%;width:16px;height:16px;font-size:10px;line-height:16px;cursor:pointer;padding:0}',
+    '.chosen.new{background:#fdece7;border-color:#f0c3b5}',
+    '.chosen.new b{color:#a8382a}',
     '.refs{border-top:1px solid #e6e9e2;padding-top:8px;display:flex;flex-direction:column;gap:6px}',
     '.refs .what{display:flex;align-items:center;gap:6px}',
     '.refs .what .tip{font-weight:500;text-transform:none;letter-spacing:0;opacity:.8}',
@@ -129,6 +256,8 @@
     '.n .meta{font-size:10px;color:#6b747b;font-weight:600;display:flex;gap:6px;flex-wrap:wrap;margin-bottom:4px}',
     '.n .meta b{color:#a8382a}',
     '.n .txt{font-size:12px;white-space:pre-wrap}',
+    '.n .comp{font-size:11px;color:#1f5a38;background:#eef3ec;border:0;border-radius:6px;padding:3px 7px;margin-top:4px;display:block}',
+    '.n .comp.new{color:#a8382a;background:#fdece7}',
     '.n .acts{margin-top:5px;display:flex;gap:6px}',
     '.n .acts button{font:inherit;font-size:11px;border:1px solid #dce0da;background:#fff;border-radius:6px;padding:3px 8px;cursor:pointer}',
     '.n.done{opacity:.55;border-style:dashed}',
@@ -158,6 +287,8 @@
   var hoverEl = null;
   var depth = 0;              // how many parents up from the hovered node
   var card = null;
+  var cardWatch = null;      // watches the card's own height (see reflow)
+  var cardReflow = null;     // the same card's window listener
   var panel = null;
 
   var pill = el('div', 'pill');
@@ -333,30 +464,56 @@
   var URL_IN_TEXT = /https?:\/\/[^\s)\]>"']+/g;
 
   /* ---------- the note composer ---------- */
-  function closeCard() { if (card) { card.remove(); card = null; } }
+  function closeCard() {
+    if (cardWatch) { cardWatch.disconnect(); cardWatch = null; }
+    if (cardReflow) { window.removeEventListener('resize', cardReflow); cardReflow = null; }
+    if (card) { card.remove(); card = null; }
+  }
 
-  function compose(target) {
+  /**
+   * The note card: writing a new note, or changing one already saved.
+   *
+   * Pass `existing` and it becomes an edit. Only the WORDS change. The
+   * selector, the element's HTML, the rectangle and the screenshots stay
+   * exactly as they were measured when the thing was first marked, so a
+   * reworded note can never quietly come loose from what it points at.
+   */
+  function compose(target, existing) {
     closeCard();
-    var box = target.rect;
+    var editing = !!existing;
+    // Editing from the list has no fresh rectangle to sit beside, so the card
+    // starts near the top of the screen and can be dragged anywhere.
+    var box = (target && target.rect) || { left: Math.max(12, window.innerWidth / 2 - 180), top: 80, width: 360, height: 0 };
+    var moved = false;
     card = el('div', 'card');
-    var w = 360;
-    var left = Math.min(Math.max(8, box.left), window.innerWidth - w - 8);
-    var top = box.top + box.height + 8;
-    if (top + 380 > window.innerHeight) top = Math.max(8, Math.min(box.top - 388, window.innerHeight - 388));
-    card.style.left = left + 'px'; card.style.top = top + 'px';
+    var thisCard = card;
 
-    card.appendChild(el('div', 'what', target.kind === 'area' ? 'A region of this screen' : 'This element'));
-    card.appendChild(el('div', 'el', target.kind === 'area'
-      ? Math.round(box.width) + '×' + Math.round(box.height) + ' at ' + Math.round(box.left) + ',' + Math.round(box.top)
-      : target.label));
+    // The top strip: what this note is about, and a handle for dragging the
+    // card off whatever it has landed on top of.
+    var grab = el('div', 'grab');
+    grab.appendChild(el('span', 'dots', '⠿'));
+    grab.appendChild(el('span', 'ttl', editing
+      ? 'Editing note #' + existing.n
+      : (target && target.kind === 'area' ? 'A region of this screen' : 'This element')));
+    var shut = el('button', 'shut', '×');
+    shut.title = 'Close without saving';
+    grab.appendChild(shut);
+    card.appendChild(grab);
+
+    card.appendChild(el('div', 'el', editing
+      ? (existing.element || existing.selector || existing.route || '')
+      : (target.kind === 'area'
+        ? Math.round(box.width) + '×' + Math.round(box.height) + ' at ' + Math.round(box.left) + ',' + Math.round(box.top)
+        : target.label)));
 
     var ta = el('textarea');
     ta.placeholder = 'What is wrong with this, or what should it become?';
+    if (editing) ta.value = existing.text || '';
     card.appendChild(ta);
 
     var chips = el('div', 'chips');
     var kinds = ['Fix this', 'Redesign', 'Idea', 'Question', 'Broken'];
-    var kind = 'Fix this';
+    var kind = (editing && kinds.indexOf(existing.kind) >= 0) ? existing.kind : 'Fix this';
     kinds.forEach(function (k) {
       var c = el('button', 'chip' + (k === kind ? ' on' : ''), k);
       c.onclick = function () {
@@ -369,7 +526,7 @@
     card.appendChild(chips);
 
     /* "Show me what you mean": links to other sites and pictures. */
-    var links = [];
+    var links = editing ? (existing.links || []).slice() : [];
     var images = [];   // { name, data, role, w, h }
     var refs = el('div', 'refs');
     var head = el('div', 'what', 'Show me what you mean');
@@ -404,6 +561,15 @@
       tools.appendChild(bSnap);
     }
     refs.appendChild(tools);
+    // An edit changes words, not pictures: the snap and any reference
+    // images stay as they were saved. Offering the buttons here would
+    // promise something the edit route does not do.
+    if (editing) {
+      tools.style.display = 'none';
+      head.textContent = '';
+      head.appendChild(el('span', null, 'Links'));
+      head.appendChild(el('span', 'tip', '· pictures on this note stay as they are'));
+    }
 
     var attach = el('div', 'attach');
     attach.style.display = 'none';
@@ -484,10 +650,127 @@
       }
     });
 
+    /* ---------- which library component belongs here ----------
+       Naming one is the whole point of this row: "USE THIS COMPONENT" in
+       notes.md is an instruction to the next chat, not a hint. Typing a name
+       by hand always works, so a library that is down or not deployed yet
+       never blocks a note. */
+    var comp = { name: (editing && existing.component) || '', url: (editing && existing.component_url) || '' };
+    var compNew = !!(editing && existing.component_new);
+    var cursor = -1;
+
+    var cbox = el('div', 'comp');
+    var chead = el('div', 'what', 'Build this out of');
+    chead.appendChild(el('span', 'tip', '· a component from the library'));
+    cbox.appendChild(chead);
+
+    var crow = el('div', 'comprow');
+    var cIn = el('input');
+    cIn.type = 'text';
+    cIn.placeholder = 'Type a component name, or leave it blank';
+    var cBrowse = el('button', 'btn sm', 'Open the library');
+    cBrowse.title = 'Open the catalogue and click the component you want';
+    crow.append(cIn, cBrowse);
+    cbox.appendChild(crow);
+
+    var hits = el('div', 'hits');
+    hits.style.display = 'none';
+    cbox.appendChild(hits);
+
+    var chosen = el('div');
+    cbox.appendChild(chosen);
+
+    var cNew = el('button', 'btn sm', 'Nothing fits · build a new one');
+    cbox.appendChild(cNew);
+    card.appendChild(cbox);
+
+    function paintChosen() {
+      chosen.textContent = '';
+      if (comp.name) {
+        var c = el('div', 'chosen');
+        c.appendChild(el('span', null, 'Use'));
+        c.appendChild(el('b', null, comp.name));
+        var x = el('button', 'x', '×'); x.title = 'Not this one';
+        x.onclick = function () { comp = { name: '', url: '' }; paintChosen(); };
+        c.appendChild(x);
+        chosen.appendChild(c);
+      } else if (compNew) {
+        var n = el('div', 'chosen new');
+        n.appendChild(el('b', null, 'Build a new component for this'));
+        var nx = el('button', 'x', '×'); nx.title = 'Never mind';
+        nx.onclick = function () { compNew = false; paintChosen(); };
+        n.appendChild(nx);
+        chosen.appendChild(n);
+      }
+      var settled = !!(comp.name || compNew);
+      cNew.style.display = settled ? 'none' : '';
+      crow.style.display = settled ? 'none' : 'flex';
+      if (settled) hits.style.display = 'none';
+      reflow();
+    }
+
+    function paintHits(list) {
+      hits.textContent = '';
+      if (!list.length) {
+        hits.appendChild(el('div', 'none', catalogueError
+          ? 'Cannot reach the library (' + catalogueError + '). Type the name yourself and press Enter.'
+          : 'Nothing by that name. Press Enter to use what you typed anyway.'));
+      } else {
+        list.forEach(function (c, i) {
+          var b = el('button', i === cursor ? 'cur' : null);
+          b.appendChild(el('span', null, c.name));
+          if (c.group) b.appendChild(el('span', 'g', c.group));
+          if (c.house) b.appendChild(el('span', 'house', 'HOUSE STYLE'));
+          b.onclick = function () { choose(c); };
+          hits.appendChild(b);
+        });
+      }
+      hits.style.display = '';
+      reflow();
+    }
+
+    function choose(c) {
+      if (!c || !c.name) return;
+      comp = { name: c.name, url: c.url || (LIBRARY + (c.block ? '/#' + c.block : '')) };
+      compNew = false;
+      cIn.value = '';
+      cursor = -1;
+      paintChosen();
+      ta.focus();
+    }
+
+    cIn.onfocus = function () { paintHits(searchCatalogue(cIn.value)); };
+    cIn.oninput = function () { cursor = -1; paintHits(searchCatalogue(cIn.value)); };
+    cIn.onkeydown = function (e) {
+      e.stopPropagation();
+      var list = searchCatalogue(cIn.value);
+      if (e.key === 'ArrowDown') { e.preventDefault(); cursor = Math.min(cursor + 1, list.length - 1); paintHits(list); }
+      else if (e.key === 'ArrowUp') { e.preventDefault(); cursor = Math.max(cursor - 1, -1); paintHits(list); }
+      else if (e.key === 'Enter') {
+        e.preventDefault();
+        if (cursor >= 0 && list[cursor]) choose(list[cursor]);
+        else if (cIn.value.trim()) choose({ name: cIn.value.trim(), block: '' });
+      } else if (e.key === 'Escape') { hits.style.display = 'none'; reflow(); }
+    };
+    cBrowse.onclick = function () {
+      say('Pick a component in the library tab');
+      browseLibrary(function (picked) {
+        if (card !== thisCard) return;      // the note was closed while I was away
+        if (picked && picked.name) { choose(picked); say('Using ' + picked.name); }
+      });
+    };
+    cNew.onclick = function () {
+      compNew = true;
+      comp = { name: '', url: '' };
+      paintChosen();
+      ta.focus();
+    };
+    loadCatalogue().then(function () { if (card === thisCard && hits.style.display !== 'none') paintHits(searchCatalogue(cIn.value)); });
+
     var row = el('div', 'row');
     row.appendChild(el('span', 'sp', '⌘⏎ to save'));
     var cancel = el('button', 'btn', 'Cancel');
-    var save = el('button', 'btn pri', 'Save note');
+    var save = el('button', 'btn pri', editing ? 'Save changes' : 'Save note');
     row.append(cancel, save);
     card.appendChild(row);
 
@@ -501,6 +784,28 @@
       save.textContent = 'Saving…';
       // Any web address typed into the note counts as a reference link too.
       (text.match(URL_IN_TEXT) || []).forEach(function (u) { if (links.indexOf(u) < 0) links.push(u); });
+
+      // An edit sends only what a person can retype. Everything measured off
+      // the page when this was first marked is left alone on purpose.
+      if (editing) {
+        call('POST', '/note/' + existing.id + '/edit', {
+          text: text, kind: kind, links: links.slice(),
+          component: comp.name, component_url: comp.url, component_new: compNew,
+        }).then(function (res) {
+          var updated = (res && res.note) || null;
+          if (updated) notes = notes.map(function (x) { return x.id === existing.id ? updated : x; });
+          paintPill();
+          if (panel) renderPanel();
+          say('Note #' + existing.n + ' updated');
+          if (card === thisCard) { closeCard(); clearHi(); }
+        }).catch(function () {
+          saving = false;
+          save.textContent = 'Save changes';
+          say('Could not save that change');
+        });
+        return;
+      }
+
       var note = {
         app: APP, title: document.title,
         url: location.href, route: location.pathname + location.hash,
@@ -512,6 +817,9 @@
         at: new Date().toISOString(),
         links: links.slice(),
         images: images.slice(),
+        component: comp.name,
+        component_url: comp.url,
+        component_new: compNew,
       };
       var snap = snapOn ? snapMarked(box).catch(function (err) { say(err.message); return null; }) : Promise.resolve(null);
       var myCard = card;
@@ -526,7 +834,83 @@
       if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) save.onclick();
     };
 
+    /* ---------- where the card sits ----------
+       Measured, never guessed. The card grows as the attachments and the
+       component list open, and a guessed height once put the Save button
+       under the bottom of the screen. It also tries every side of the thing
+       being marked before it covers it. Once you drag the card, it stays
+       where you put it. */
+    function reflow() {
+      if (!card || moved) return;
+      var pad = 10;
+      var vw = window.innerWidth, vh = window.innerHeight;
+      var r = card.getBoundingClientRect();
+      var w = r.width, h = r.height;
+      var spots = [
+        { x: box.left, y: box.top + box.height + pad },   // under it
+        { x: box.left, y: box.top - h - pad },            // over it
+        { x: box.left + box.width + pad, y: box.top },    // to its right
+        { x: box.left - w - pad, y: box.top },            // to its left
+      ];
+      var best = null;
+      for (var i = 0; i < spots.length && !best; i++) {
+        var sp = spots[i];
+        if (sp.x >= pad && sp.y >= pad && sp.x + w <= vw - pad && sp.y + h <= vh - pad) best = sp;
+      }
+      // Nothing clears it: sit as low as the screen allows, which at least
+      // keeps the whole card and its buttons reachable.
+      if (!best) best = { x: box.left, y: vh - h - pad };
+      card.style.left = Math.max(pad, Math.min(best.x, vw - w - pad)) + 'px';
+      card.style.top = Math.max(pad, Math.min(best.y, vh - h - pad)) + 'px';
+    }
+
+    grab.addEventListener('pointerdown', function (e) {
+      if (e.target === shut) return;
+      e.preventDefault();
+      var r = card.getBoundingClientRect();
+      var dx = e.clientX - r.left, dy = e.clientY - r.top;
+      grab.classList.add('on');
+      moved = true;
+      var go = function (ev) {
+        card.style.left = Math.max(2, Math.min(ev.clientX - dx, window.innerWidth - r.width - 2)) + 'px';
+        card.style.top = Math.max(2, Math.min(ev.clientY - dy, window.innerHeight - r.height - 2)) + 'px';
+      };
+      var stop = function () {
+        grab.classList.remove('on');
+        window.removeEventListener('pointermove', go, true);
+        window.removeEventListener('pointerup', stop, true);
+      };
+      window.addEventListener('pointermove', go, true);
+      window.addEventListener('pointerup', stop, true);
+    });
+    shut.onclick = function () { closeCard(); clearHi(); };
+
     wrap.appendChild(card);
+    paintChosen();
+    reflow();
+    // The card changes height whenever something opens or closes inside it.
+    // Watch the box rather than guessing it (the same lesson the dock's
+    // glass learned the hard way).
+    if (typeof ResizeObserver !== 'undefined') {
+      cardWatch = new ResizeObserver(function () { reflow(); });
+      cardWatch.observe(card);
+      // ALSO `wrap`, which is the viewport. Watching only the card is not
+      // enough: once the card is tall enough to hit its max-height it stops
+      // growing, so making the WINDOW smaller changes nothing about the
+      // card's own box, the observer never fires, and the card is left
+      // hanging below the fold with its buttons off screen (seen at
+      // 1280x420, 15 Sep 2026).
+      //
+      // It has to be `wrap` and not documentElement: documentElement's box is
+      // the whole DOCUMENT (39,789px tall on the catalogue), which does not
+      // change when the viewport does. `wrap` is position:fixed inset:0, so
+      // its box IS the viewport, and it changes the moment the window does.
+      cardWatch.observe(wrap);
+    }
+    // And the window event, for the same reason the dock keeps one: a browser
+    // without ResizeObserver still has to put the card somewhere sensible.
+    cardReflow = reflow;
+    window.addEventListener('resize', cardReflow);
     setTimeout(function () { ta.focus(); }, 0);
   }
 
@@ -665,8 +1049,14 @@
       if (nl || ni) meta.appendChild(el('span', null, (nl ? '🔗' + nl + ' ' : '') + (ni ? '🖼' + ni : '')));
       box.appendChild(meta);
       box.appendChild(el('div', 'txt', n.text));
+      if (n.component) box.appendChild(el('div', 'comp', '🧩 Build it with ' + n.component));
+      else if (n.component_new) box.appendChild(el('div', 'comp new', '🧩 New component wanted'));
       if (done) box.appendChild(el('div', 'did', 'Done by ' + (n.done_by || '?') + ': ' + (n.action || 'no detail given')));
       var acts = el('div', 'acts');
+      // Reopen the note in the card it was written in, words and component
+      // filled in. Nothing measured off the page is touched by an edit.
+      var edit = el('button', null, 'Edit');
+      edit.onclick = function () { compose(null, n); };
       var flip = el('button', null, done ? 'Reopen' : 'Done');
       flip.onclick = function () {
         call('POST', '/note/' + n.id + (done ? '/reopen' : '/done'), { by: 'me', action: '' })
@@ -677,10 +1067,12 @@
       };
       var del = el('button', null, 'Delete');
       del.onclick = function () {
+        // A note is work. Ask before it goes, because there is no undo.
+        if (!window.confirm('Delete note #' + n.n + '? There is no undo.')) return;
         call('DELETE', '/note/' + n.id)
           .then(function () { notes = notes.filter(function (x) { return x.id !== n.id; }); paintPill(); renderPanel(); });
       };
-      acts.append(flip, del);
+      acts.append(edit, flip, del);
       box.appendChild(acts);
       list.appendChild(box);
     });
@@ -767,6 +1159,9 @@
         if (n.status === 'done') out.push('- **Done** by ' + (n.done_by || '?') + ' on ' + String(n.done_at || '').slice(0, 16).replace('T', ' ') + ': ' + (n.action || '(no detail given)'));
         if (n.element) out.push('- **Element:** ' + n.element);
         if (n.selector) out.push('- **Selector:** `' + n.selector + '`');
+        // The same instruction server.py writes, so the zip and the file agree.
+        if (n.component) out.push('- **USE THIS COMPONENT:** `' + n.component + '` from @proact/ui' + (n.component_url ? ' · ' + n.component_url : ''));
+        if (n.component_new) out.push('- **NEW COMPONENT WANTED:** nothing in the library fits this spot. Add it to @proact/ui first, then use it here.');
         if (n.target_kind === 'area' && n.rect) out.push('- **Region:** ' + n.rect.w + '×' + n.rect.h + ' at (' + n.rect.x + ', ' + n.rect.y + '), viewport ' + n.viewport);
         out.push('- **URL:** ' + n.url);
         (n.links || []).forEach(function (l) { out.push('- **Reference link (make it like this):** ' + l); });

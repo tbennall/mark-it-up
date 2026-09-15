@@ -60,6 +60,25 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
     return true;
   }
 
+  // The component catalogue. Fetched here rather than in the page, so the
+  // marked-up site's Content Security Policy never sees the request.
+  if (msg.type === 'library') {
+    fetch(msg.url, { credentials: 'omit' })
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status))))
+      .then((data) => reply({ ok: true, data }))
+      .catch((err) => reply({ ok: false, error: err.message || 'could not reach the library' }));
+    return true;
+  }
+
+  // "Open the library": a tab on the catalogue in pick mode, watched below.
+  if (msg.type === 'pick') {
+    const from = sender.tab ? sender.tab.id : null;
+    chrome.tabs.create({ url: msg.url, active: true })
+      .then((tab) => { picks.set(tab.id, { token: msg.token, from }); reply({ ok: true }); })
+      .catch((err) => reply({ ok: false, error: err.message }));
+    return true;
+  }
+
   if (msg.type !== 'notes') return false;
   viaServer(msg)
     .then((res) => reply(res))
@@ -128,6 +147,24 @@ async function localStore(msg) {
     return done({ ok: true, note });
   }
 
+  // Reword a note. Only the parts a person can retype: everything measured
+  // off the page when it was marked stays as it was (see server.py).
+  m = path.match(/^\/note\/([A-Za-z0-9#]+)\/edit$/);
+  if (method === 'POST' && m) {
+    const note = find(m[1]);
+    if (!note) return fail('no such note');
+    ['text', 'kind', 'component', 'component_url'].forEach((f) => {
+      if (body && f in body) note[f] = String(body[f] || '').trim().slice(0, 4000);
+    });
+    if (body && 'component_new' in body) note.component_new = !!body.component_new;
+    if (body && 'links' in body) {
+      note.links = (body.links || []).filter((l) => typeof l === 'string' && /^https?:\/\//.test(l)).slice(0, 20);
+    }
+    note.edited_at = localStamp();
+    await save();
+    return done({ ok: true, note });
+  }
+
   if (method === 'POST' && path === '/file-done') {
     const moving = state.notes.filter((n) => n.status === 'done');
     state.filed = state.filed.concat(moving);
@@ -163,3 +200,38 @@ function randomId() {
   const bytes = crypto.getRandomValues(new Uint8Array(5));
   return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
 }
+
+// ---------------------------------------------------------------------------
+// Picking a component out of the catalogue.
+//
+// The catalogue answers by putting the choice in its OWN address bar
+// (`#picked=WheelPicker&block=wheels`). That is deliberate: it means the
+// catalogue needs to know nothing about this extension (an unpacked
+// extension's id changes from machine to machine), and the same page works
+// on Fly, on a local dev server, or opened straight off disk.
+//
+// One tab at a time per pick. Close the tab without choosing and the entry
+// is dropped; nothing is left waiting.
+// ---------------------------------------------------------------------------
+const picks = new Map(); // tabId -> { token, from }
+
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  const want = picks.get(tabId);
+  if (!want || !changeInfo.url) return;
+  const params = new URLSearchParams(changeInfo.url.split('#')[1] || '');
+  if (!params.has('picked')) return;
+  picks.delete(tabId);
+  const component = {
+    name: params.get('picked') || '',
+    block: params.get('block') || '',
+    group: params.get('group') || '',
+    house: params.get('house') === '1',
+    url: params.get('at') || '',
+  };
+  chrome.tabs.remove(tabId).catch(() => {});
+  if (want.from == null) return;
+  chrome.tabs.update(want.from, { active: true }).catch(() => {});
+  chrome.tabs.sendMessage(want.from, { type: 'picked', token: want.token, component }).catch(() => {});
+});
+
+chrome.tabs.onRemoved.addListener((tabId) => { picks.delete(tabId); });
