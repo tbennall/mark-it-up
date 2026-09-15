@@ -11,7 +11,13 @@
 (function () {
   'use strict';
 
+  // The notes server. Overridable, because a review tool that can only ever
+  // write to one file on one port cannot be tested without writing to Tom's
+  // real notes (which is exactly what happened on 15 Sep 2026). Only the
+  // injected path reads this; through the extension every request goes to the
+  // background worker, which always uses the real server.
   var SERVER = 'http://localhost:8899';
+  try { SERVER = window.__reviewNotesServer || localStorage.getItem('__review_notes_server') || SERVER; } catch (err) { /* ignore */ }
   if (window.__reviewNotes) { window.__reviewNotes.toggle(); return; }
   // Injected into every frame of the tab so things inside an embedded page
   // (a Claude artefact, say) can be marked. Tiny frames (ad slots, hidden
@@ -282,6 +288,7 @@
   var depth = 0;              // how many parents up from the hovered node
   var card = null;
   var cardWatch = null;      // watches the card's own height (see reflow)
+  var cardReflow = null;     // the same card's window listener
   var panel = null;
 
   var pill = el('div', 'pill');
@@ -459,6 +466,7 @@
   /* ---------- the note composer ---------- */
   function closeCard() {
     if (cardWatch) { cardWatch.disconnect(); cardWatch = null; }
+    if (cardReflow) { window.removeEventListener('resize', cardReflow); cardReflow = null; }
     if (card) { card.remove(); card = null; }
   }
 
@@ -886,7 +894,23 @@
     if (typeof ResizeObserver !== 'undefined') {
       cardWatch = new ResizeObserver(function () { reflow(); });
       cardWatch.observe(card);
+      // ALSO `wrap`, which is the viewport. Watching only the card is not
+      // enough: once the card is tall enough to hit its max-height it stops
+      // growing, so making the WINDOW smaller changes nothing about the
+      // card's own box, the observer never fires, and the card is left
+      // hanging below the fold with its buttons off screen (seen at
+      // 1280x420, 15 Sep 2026).
+      //
+      // It has to be `wrap` and not documentElement: documentElement's box is
+      // the whole DOCUMENT (39,789px tall on the catalogue), which does not
+      // change when the viewport does. `wrap` is position:fixed inset:0, so
+      // its box IS the viewport, and it changes the moment the window does.
+      cardWatch.observe(wrap);
     }
+    // And the window event, for the same reason the dock keeps one: a browser
+    // without ResizeObserver still has to put the card somewhere sensible.
+    cardReflow = reflow;
+    window.addEventListener('resize', cardReflow);
     setTimeout(function () { ta.focus(); }, 0);
   }
 
