@@ -67,6 +67,27 @@ def mark(note, done, action="", by="claude"):
     return note
 
 
+# What a person is allowed to change after a note is saved. Everything else
+# on a note was MEASURED off the page when it was marked (the selector, the
+# element's HTML, the rectangle, the screenshots), so an edit never touches
+# it: a note can be reworded, but it can never quietly come loose from the
+# thing it points at.
+EDITABLE_TEXT = ("text", "kind", "component", "component_url")
+
+
+def apply_edit(note, body):
+    """Change only the parts Tom can retype. Returns the note."""
+    for field in EDITABLE_TEXT:
+        if field in body:
+            note[field] = str(body.get(field) or "").strip()[:4000]
+    if "component_new" in body:
+        note["component_new"] = bool(body.get("component_new"))
+    if "links" in body:
+        note["links"] = clean_links(body.get("links"))
+    note["edited_at"] = datetime.now().isoformat(timespec="seconds")
+    return note
+
+
 def read_filed():
     if not os.path.exists(FILED_JSONL):
         return []
@@ -203,6 +224,15 @@ def note_markdown(note):
         lines.append(f"- **Element:** {note['element']}")
     if note.get("selector"):
         lines.append(f"- **Selector:** `{note['selector']}`")
+    # The component Tom picked out of the library for this spot. This is an
+    # instruction, not a hint: build it with this piece, do not hand-roll a
+    # lookalike.
+    if note.get("component"):
+        where = f" · {note['component_url']}" if note.get("component_url") else ""
+        lines.append(f"- **USE THIS COMPONENT:** `{note['component']}` from @proact/ui{where}")
+    if note.get("component_new"):
+        lines.append("- **NEW COMPONENT WANTED:** nothing in the library fits this spot. "
+                     "Add it to @proact/ui first, then use it here.")
     if note.get("target_kind") == "area":
         rect = note.get("rect") or {}
         lines.append(
@@ -387,6 +417,21 @@ class Handler(BaseHTTPRequestHandler):
                 mark(note, status.group(2) == "done", body.get("action", ""), body.get("by") or "tom")
                 write_notes(notes)
             print(f"  note #{note['n']} {'done' if is_done(note) else 'reopened'}: {note.get('action', '')[:70]}")
+            self._send(200, json.dumps({"ok": True, "note": note}))
+            return
+
+        # Reword a note after it was written: POST /note/<id or number>/edit
+        edit = re.match(r"^/note/([A-Za-z0-9#]+)/edit$", self.path)
+        if edit:
+            with LOCK:
+                notes = read_notes()
+                note = find_note(notes, edit.group(1))
+                if not note:
+                    self._send(404, json.dumps({"error": "no such note"}))
+                    return
+                apply_edit(note, body)
+                write_notes(notes)
+            print(f"  note #{note['n']} edited: {note.get('text', '')[:70]}")
             self._send(200, json.dumps({"ok": True, "note": note}))
             return
 
