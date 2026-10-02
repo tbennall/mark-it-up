@@ -81,7 +81,7 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
 
   if (msg.type !== 'notes') return false;
   viaServer(msg)
-    .then((res) => reply(res))
+    .then((res) => { moveLocalNotesToServer(); return reply(res); })
     .catch(() => localStore(msg).then((res) => reply(res)))
     .catch((err) => reply({ ok: false, error: err.message || 'failed' }));
   return true; // reply arrives asynchronously
@@ -97,6 +97,46 @@ async function viaServer(msg) {
   });
   const data = await r.json().catch(() => ({}));
   return { ok: r.ok, data, store: 'server', error: r.ok ? '' : 'HTTP ' + r.status };
+}
+
+// ---------------------------------------------------------------------------
+// When the server comes back, hand it every note that was kept in Chrome while
+// it was down. Without this, those notes stay hidden: once the server answers,
+// the overlay only ever shows the server's list, and notes.md never gets them.
+//
+// Safe to run twice: a note already on the server (same "at" and text) is not
+// sent again, and a note leaves Chrome only after the server has accepted it.
+// ---------------------------------------------------------------------------
+let moving = null;
+function moveLocalNotesToServer() {
+  if (!moving) moving = moveNow().catch((err) => console.warn('Mark it up: could not move notes to the server yet', err)).finally(() => { moving = null; });
+  return moving;
+}
+
+async function moveNow() {
+  const { notes } = await chrome.storage.local.get({ notes: [] });
+  if (!notes.length) return;
+  const onServer = await viaServer({ method: 'GET', path: '/notes' });
+  if (!onServer.ok) return;
+  const sameNote = (a, b) => a.at === b.at && a.text === b.text;
+  const moved = [];
+  for (const note of notes) {
+    if (!(onServer.data.notes || []).some((s) => sameNote(s, note))) {
+      const body = Object.assign({}, note);
+      delete body.id; delete body.n; delete body.status;
+      body.images = (note.images || []).map((im) => ({ name: im.name, role: im.role, w: im.w, h: im.h, data: im.data }));
+      const res = await viaServer({ method: 'POST', path: '/note', body });
+      if (!res.ok) continue; // try again next time
+      if (note.status === 'done') {
+        await viaServer({ method: 'POST', path: '/note/' + res.data.note.id + '/done', body: { action: note.action || '', by: note.done_by || 'tom' } });
+      }
+    }
+    moved.push(note.id);
+  }
+  // Re-read before saving: a note made while this ran must not be lost.
+  const now = await chrome.storage.local.get({ notes: [] });
+  await chrome.storage.local.set({ notes: now.notes.filter((n) => !moved.includes(n.id)) });
+  console.log('Mark it up: moved ' + moved.length + ' note(s) from Chrome to the server');
 }
 
 // ---------------------------------------------------------------------------

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Mark it up",
-  "version": "1.3",
+  "version": "1.4",
   "description": "Point at anything on any page, say what is wrong with it, and hand the notes to Claude.",
   "action": {
     "default_title": "Mark it up (Alt+Shift+N)"
