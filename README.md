@@ -124,6 +124,30 @@ python3 ~/path/to/mark-it-up/server.py
   `python3 server.py list` shows what is open, one line each.
 - The extension notices the server on its own. With it running, notes go to
   the files; without it, they stay in the extension and you export them.
+  When the server comes back, the extension hands it every note it kept in
+  the meantime, so nothing is stranded in Chrome.
+- The server does not survive a restart of your Mac unless something starts
+  it. To have macOS start it at login and restart it if it stops, save this
+  as `~/Library/LaunchAgents/com.markitup.server.plist` (fix the two paths),
+  then run `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.markitup.server.plist`:
+
+  ```xml
+  <?xml version="1.0" encoding="UTF-8"?>
+  <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+  <plist version="1.0">
+  <dict>
+    <key>Label</key><string>com.markitup.server</string>
+    <key>ProgramArguments</key>
+    <array>
+      <string>/usr/bin/python3</string>
+      <string>/Users/YOU/path/to/mark-it-up/server.py</string>
+    </array>
+    <key>WorkingDirectory</key><string>/Users/YOU/path/to/mark-it-up</string>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+  </dict>
+  </plist>
+  ```
 
 ## What is in here
 
